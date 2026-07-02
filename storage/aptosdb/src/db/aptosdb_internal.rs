@@ -64,27 +64,29 @@ impl AptosDB {
         let state_merkle_db = Arc::new(state_merkle_db);
         let hot_state_kv_db = Arc::new(hot_state_kv_db);
         let state_kv_db = Arc::new(state_kv_db);
-        let state_pruner = StatePruner::new(
-            Arc::clone(&hot_state_merkle_db),
-            Arc::clone(&state_merkle_db),
-            Arc::clone(&hot_state_kv_db),
-            Arc::clone(&state_kv_db),
-            pruner_config,
+        let state_pruner = StatePruner::builder()
+            .hot_state_merkle_db(Arc::clone(&hot_state_merkle_db))
+            .state_merkle_db(Arc::clone(&state_merkle_db))
+            .hot_state_kv_db(Arc::clone(&hot_state_kv_db))
+            .state_kv_db(Arc::clone(&state_kv_db))
+            .config(pruner_config)
+            .build();
+        let state_store = Arc::new(
+            StateStore::builder()
+                .ledger_db(Arc::clone(&ledger_db))
+                .hot_state_merkle_db(hot_state_merkle_db)
+                .state_merkle_db(Arc::clone(&state_merkle_db))
+                .hot_state_kv_db(Arc::clone(&hot_state_kv_db))
+                .state_kv_db(Arc::clone(&state_kv_db))
+                .state_pruner(state_pruner)
+                .buffered_state_target_items(buffered_state_target_items)
+                .hack_for_tests(hack_for_tests)
+                .empty_buffered_state_for_restore(empty_buffered_state_for_restore)
+                .skip_usage(true)
+                .maybe_internal_indexer_db(internal_indexer_db.clone())
+                .hot_state_config(hot_state_config)
+                .build(),
         );
-        let state_store = Arc::new(StateStore::new(
-            Arc::clone(&ledger_db),
-            hot_state_merkle_db,
-            Arc::clone(&state_merkle_db),
-            Arc::clone(&hot_state_kv_db),
-            Arc::clone(&state_kv_db),
-            state_pruner,
-            buffered_state_target_items,
-            hack_for_tests,
-            empty_buffered_state_for_restore,
-            true, /* skip_usage */
-            internal_indexer_db.clone(),
-            hot_state_config,
-        ));
 
         // The native-position DB isn't open here; it attaches later
         // via `AptosDB::init_native_position`, which re-binds the
@@ -246,7 +248,13 @@ impl AptosDB {
                         .value_pruner
                         .maybe_set_pruner_target_db_version(version);
                 }
-                if let Some(version) = bundle.snapshot_version {
+                // Drive the merkle pruners to the persisted base version
+                // (set after init's seed + replay).
+                if let Some(version) = bundle
+                    .persisted
+                    .as_ref()
+                    .and_then(|persisted| persisted.get().version())
+                {
                     position_pruner
                         .state_merkle_pruner
                         .maybe_set_pruner_target_db_version(version);

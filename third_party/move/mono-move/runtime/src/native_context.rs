@@ -69,7 +69,7 @@ pub struct ProductionNativeContext<'a> {
     frame_ptr: *mut u8,
     /// Gas meter for the current transaction.
     ///
-    /// TODO: Expose to native functions.
+    /// TODO(completeness): Expose to native functions.
     #[allow(dead_code)]
     gas: UnsafeCell<&'a mut GasMeter>,
     /// The VM's heap -- used by the natives to allocate new heap objects.
@@ -90,7 +90,7 @@ pub struct ProductionNativeContext<'a> {
 }
 
 impl<'a> ProductionNativeContext<'a> {
-    // TODO: revisit this lint.
+    // TODO(cleanup): revisit this lint.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         frame_ptr: *mut u8,
@@ -221,7 +221,7 @@ impl NativeContext for ProductionNativeContext<'_> {
         // the length check makes the copy in-bounds. `bytes` is a valid
         // representation of the slot's type, per this method's contract.
         //
-        // TODO: `bytes` must NOT alias the return slot it is written to.
+        // TODO(correctness): `bytes` must NOT alias the return slot it is written to.
         // This is currently ensured by the `return_started` flag and the absence
         // of value types that reference the frame.
         // Re-audit this if new value APIs are added.
@@ -248,6 +248,15 @@ impl NativeContext for ProductionNativeContext<'_> {
                 self.ty_args.len(),
             ))
         })
+    }
+
+    fn value_size(&self, ty: InternedType) -> Result<u32, VMInternalError> {
+        self.layouts
+            .size_and_align(ty)
+            .map(|(size, _)| size)
+            .ok_or_else(|| {
+                VMInternalError::invariant_violation("value_size: type has no known layout".into())
+            })
     }
 
     fn arg_raw(&self, i: usize) -> Result<Vec<u8>, VMInternalError> {
@@ -316,6 +325,13 @@ impl NativeContext for ProductionNativeContext<'_> {
             ));
         }
         let len = bytes.len() as u64;
+        if len == 0 {
+            // TODO(correctness): audit empty <=> null vector invariant
+            // SAFETY: passing `null` is always safe.
+            let handle = unsafe { self.pool.root_object(std::ptr::null_mut()) };
+            return Ok(Vector::from_handle(handle));
+        }
+
         // SAFETY: `heap` and `rws` are distinct fields, so reborrowing both
         // through `&self` at once is sound — at most one `&mut` per field is
         // live (see the type-level aliasing rule).
@@ -478,17 +494,15 @@ impl NativeContext for ProductionNativeContext<'_> {
         Ok(Boxed::from_handle(unsafe { self.pool.root_object(obj) }))
     }
 
-    // TODO(replay): `value_ty` on these table ops is currently unused; wire it
-    // to the storage provider so a working-map miss can deserialize from storage.
     fn table_contains(
         &self,
         handle: &TableHandle,
         key: &[u8],
-        _value_ty: InternedType,
+        value_ty: InternedType,
     ) -> Result<bool, VMInternalError> {
         // SAFETY: `rws` is reborrowed exclusively here.
         let rws = unsafe { &mut **self.rws.get() };
-        let storage_key = InMemoryStorageKey::table_item(*handle, key.into());
+        let storage_key = InMemoryStorageKey::table_item(*handle, key.into(), value_ty);
         Ok(rws.exists(self.resource_provider, &storage_key)?)
     }
 
@@ -497,9 +511,9 @@ impl NativeContext for ProductionNativeContext<'_> {
         handle: &TableHandle,
         key: &[u8],
         mutable: bool,
-        _value_ty: InternedType,
+        value_ty: InternedType,
     ) -> Result<Option<Ref<'_, Opaque>>, VMInternalError> {
-        let storage_key = InMemoryStorageKey::table_item(*handle, key.into());
+        let storage_key = InMemoryStorageKey::table_item(*handle, key.into(), value_ty);
         // SAFETY: heap and rws are distinct fields (see the aliasing rule).
         let rws = unsafe { &mut **self.rws.get() };
         let ptr = if mutable {
@@ -542,7 +556,7 @@ impl NativeContext for ProductionNativeContext<'_> {
         Ok(Some(Ref::from_handle(handle)))
     }
 
-    // TODO: See if there's a way to separate out argument-reading from boxing.
+    // TODO(cleanup): See if there's a way to separate out argument-reading from boxing.
     //       Currently they are both handled here for GC-safety.
     fn box_arg<'a>(
         &'a self,
@@ -593,9 +607,9 @@ impl NativeContext for ProductionNativeContext<'_> {
         handle: &TableHandle,
         key: &[u8],
         value: Boxed<'_, Opaque>,
-        _value_ty: InternedType,
+        value_ty: InternedType,
     ) -> Result<bool, VMInternalError> {
-        let storage_key = InMemoryStorageKey::table_item(*handle, key.into());
+        let storage_key = InMemoryStorageKey::table_item(*handle, key.into(), value_ty);
         let obj = NonNull::new(value.ptr()).ok_or_else(|| {
             VMInternalError::invariant_violation("table_add: null boxed value".into())
         })?;
@@ -612,9 +626,9 @@ impl NativeContext for ProductionNativeContext<'_> {
         &self,
         handle: &TableHandle,
         key: &[u8],
-        _value_ty: InternedType,
+        value_ty: InternedType,
     ) -> Result<Option<Boxed<'_, Opaque>>, VMInternalError> {
-        let storage_key = InMemoryStorageKey::table_item(*handle, key.into());
+        let storage_key = InMemoryStorageKey::table_item(*handle, key.into(), value_ty);
         // SAFETY: heap and rws are distinct fields (see the aliasing rule).
         let rws = unsafe { &mut **self.rws.get() };
         let ptr = match rws.try_move_from(self.resource_provider, &storage_key) {

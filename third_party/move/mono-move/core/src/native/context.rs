@@ -33,7 +33,7 @@ use move_core_types::account_address::AccountAddress;
 /// to its components through interior mutability. This is to allow handle-based value
 /// representations that are tied to the lifetime of the native call and can safely survive GC.
 //
-// TODO: add a gas-charging API (e.g. `charge_gas`). Natives currently meter no
+// TODO(metering): add a gas-charging API (e.g. `charge_gas`). Natives currently meter no
 // gas; the gas meter is already plumbed into `ProductionNativeContext`.
 pub trait NativeContext {
     /// Number of positional arguments declared by the native's ABI.
@@ -87,6 +87,10 @@ pub trait NativeContext {
 
     /// The `i`-th type argument.
     fn ty_arg(&self, i: usize) -> Result<InternedType, VMInternalError>;
+
+    /// In-memory byte size of a value of type `ty`. Errors if the type has no
+    /// published layout (e.g. an unresolved generic or an unloaded module).
+    fn value_size(&self, ty: InternedType) -> Result<u32, VMInternalError>;
 
     /// Returns a copy of the `i`-th argument's raw in-frame bytes -- a low-level
     /// API for natives that need to operate on generic opaque values.
@@ -176,7 +180,7 @@ pub trait NativeContext {
 
     /// Whether a resource of type `ty` exists at `address` in global storage.
     //
-    // TODO: see if the specializer can lower the caller (object::exists_at) to
+    // TODO(cleanup): see if the specializer can lower the caller (object::exists_at) to
     // the `Exists` micro-op directly, dropping this native path.
     fn resource_exists(
         &self,

@@ -10,7 +10,7 @@
 //! enforced by [`mono_move_core::ObjectDescriptor`]'s constructors at
 //! publish time.
 //!
-//! TODO:
+//! TODO(cleanup):
 //! 1. Call this something other than verifier (well-formedness checker) to
 //!    avoid ambiguity with bytecode verifier.
 //! 2. Replace various hard-coded constants with named constants.
@@ -18,11 +18,9 @@
 //! 4. For instructions with more than 1 destination, they must be disjoint.
 
 use mono_move_core::{
-    captured_values_size,
-    native::NativeABI,
-    types::{view_type, InternedType},
-    CallClosureOp, ClosureFuncRef, CodeOffset, DescriptorId, DescriptorProvider, FrameOffset,
-    Function, IntBinaryOp, MicroOp, ObjectDescriptorInner, PackClosureOp, ShiftOperand,
+    captured_values_size, native::NativeABI, types::InternedType, CallClosureOp, ClosureFuncRef,
+    CodeOffset, DescriptorId, DescriptorProvider, FrameOffset, Function, IntBinaryOp,
+    LayoutProvider, MicroOp, ObjectDescriptorInner, PackClosureOp, ShiftOperand,
     CLOSURE_DESCRIPTOR_ID, FRAME_METADATA_SIZE,
 };
 use std::fmt;
@@ -53,7 +51,7 @@ impl fmt::Display for VerificationError {
 
 /// Validate a single function and its pointer slots against the descriptor
 /// provider. Returns an empty `Vec` on success.
-pub fn verify_function<P: DescriptorProvider + ?Sized>(
+pub fn verify_function<P: DescriptorProvider + LayoutProvider + ?Sized>(
     func: &Function,
     provider: &P,
 ) -> Vec<VerificationError> {
@@ -69,7 +67,7 @@ pub fn verify_function<P: DescriptorProvider + ?Sized>(
 
 /// Validate every function in a program against a shared descriptor
 /// provider. Errors from each function are concatenated.
-pub fn verify_program<P: DescriptorProvider + ?Sized>(
+pub fn verify_program<P: DescriptorProvider + LayoutProvider + ?Sized>(
     funcs: &[&Function],
     provider: &P,
 ) -> Vec<VerificationError> {
@@ -84,13 +82,13 @@ pub fn verify_program<P: DescriptorProvider + ?Sized>(
 // Per-function verifier — holds shared state so helpers don't need many args
 // ---------------------------------------------------------------------------
 
-struct FunctionVerifier<'a, P: DescriptorProvider + ?Sized> {
+struct FunctionVerifier<'a, P: DescriptorProvider + LayoutProvider + ?Sized> {
     func: &'a Function,
     provider: &'a P,
     errors: &'a mut Vec<VerificationError>,
 }
 
-impl<P: DescriptorProvider + ?Sized> FunctionVerifier<'_, P> {
+impl<P: DescriptorProvider + LayoutProvider + ?Sized> FunctionVerifier<'_, P> {
     fn verify(&mut self) {
         let code = self.func.code.get();
 
@@ -277,7 +275,7 @@ impl<P: DescriptorProvider + ?Sized> FunctionVerifier<'_, P> {
             // Div / Mod imm: reject `imm == 0` statically — at runtime it
             // would always abort, so this is dead-code-with-a-bomb.
             //
-            // TODO: this changes the surface vs the old VM, which aborted
+            // TODO(cleanup): this changes the surface vs the old VM, which aborted
             // at runtime with a `DIV_BY_ZERO` status code. The cleanest
             // fix is probably for the specializer to detect `imm == 0` and
             // emit an explicit `Abort(DIV_BY_ZERO)` instead of `*U64Imm`,
@@ -335,7 +333,7 @@ impl<P: DescriptorProvider + ?Sized> FunctionVerifier<'_, P> {
             //     in-bounds slots of width `op.rhs.byte_width()`.
             //   - Bitwise ops reject signed operands.
             //
-            // TODO: also statically reject `IntDiv`/`IntMod` with an
+            // TODO(cleanup): also statically reject `IntDiv`/`IntMod` with an
             // imm-zero rhs. Same for u64 variants (currently the u64
             // variants statically error out) and shifts. Revisit once we
             // have a clearer policy on what the specializer is allowed
@@ -361,7 +359,7 @@ impl<P: DescriptorProvider + ?Sized> FunctionVerifier<'_, P> {
             // amount is statically range-checked for the imm form, and
             // signedness of `ty` is checked at runtime via the dispatcher.
             //
-            // TODO: as noted above for div/mod, the static imm range check
+            // TODO(cleanup): as noted above for div/mod, the static imm range check
             // turns a runtime abort into a verification error — revisit.
             MicroOp::IntShl(op) | MicroOp::IntShr(op) => {
                 let size = op.ty.byte_width() as u32;
@@ -1077,7 +1075,7 @@ impl<P: DescriptorProvider + ?Sized> FunctionVerifier<'_, P> {
     /// bounds check still fails the function (via the recorded error) rather
     /// than passing on an unknown size.
     fn type_size(&mut self, pc: usize, ty: InternedType) -> u32 {
-        match view_type(ty).size_and_align() {
+        match self.provider.size_and_align(ty) {
             Some((size, _align)) => size,
             None => {
                 self.err(
@@ -1247,7 +1245,7 @@ impl<P: DescriptorProvider + ?Sized> FunctionVerifier<'_, P> {
         }
     }
 
-    // TODO: validate branch gas fields are populated.
+    // TODO(metering): validate branch gas fields are populated.
     fn check_jump(&mut self, pc: usize, target: CodeOffset) {
         let code_len = self.func.code.get().len();
         if (target.0 as usize) >= code_len {

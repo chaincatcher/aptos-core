@@ -40,24 +40,18 @@ use std::ptr::NonNull;
 
 /// Call-site sugar for the allocation and GC free functions in this module.
 ///
-/// Each macro forwards to an eponymous free function, unpacking the fields
-/// of an `InterpreterContext` binding (`heap`, `descriptors`,
-/// `root_pool`, `current_func`, `pc`, `frame_ptr`) as individual
-/// arguments.
+/// Each macro forwards to an eponymous free function, unpacking the fields of an
+/// `InterpreterContext`.
 ///
 /// ```ignore
-/// let ptr = heap::macros::alloc_obj!(self, fp, desc_id)?;
+/// let ptr = heap::macros::alloc_obj!(self, fp, pc, func, desc_id)?;
 /// ```
 ///
 /// # Why macros and not methods
 ///
 /// Rust lacks partial-borrow syntax: a method on `InterpreterContext` that
-/// mutates `heap` would borrow `self` as `&mut`, conflicting with any
-/// outstanding borrow of an unrelated field (e.g. a root handle that holds
-/// `&self.root_pool`). Spelling out the individual field borrows at the
-/// call site lets the compiler see that the borrows are disjoint. The
-/// macro hides that boilerplate while preserving the field-level borrow
-/// granularity.
+/// mutates a field would borrow `self` as `&mut`, conflicting with any
+/// outstanding borrow of an unrelated field.
 ///
 /// The macros live in a submodule so their `macro_rules!` names don't
 /// collide with the free functions in the value namespace of this module
@@ -66,7 +60,7 @@ pub(crate) mod macros {
     /// Forwards to [`super::alloc_obj`]. Arguments: (`$ctx`, `$fp`,
     /// `$descriptor_id`).
     macro_rules! alloc_obj {
-        ($ctx:ident, $fp:expr, $descriptor_id:expr $(,)?) => {
+        ($ctx:ident, $fp:expr, $pc:expr, $func:expr, $descriptor_id:expr $(,)?) => {
             $crate::heap::alloc_obj(
                 &mut $ctx.heap,
                 $ctx.exec_ctx,
@@ -75,8 +69,8 @@ pub(crate) mod macros {
                 $ctx.exec_ctx.extensions(),
                 $fp,
                 $crate::heap::TopFrame::Function {
-                    func: $ctx.current_func,
-                    pc: $ctx.pc,
+                    func: $func,
+                    pc: $pc,
                 },
                 $descriptor_id,
             )
@@ -90,6 +84,8 @@ pub(crate) mod macros {
         (
             $ctx:ident,
             $fp:expr,
+            $pc:expr,
+            $func:expr,
             $descriptor_id:expr,
             $elem_size:expr,
             $capacity_in_elems:expr $(,)?
@@ -102,8 +98,8 @@ pub(crate) mod macros {
                 $ctx.exec_ctx.extensions(),
                 $fp,
                 $crate::heap::TopFrame::Function {
-                    func: $ctx.current_func,
-                    pc: $ctx.pc,
+                    func: $func,
+                    pc: $pc,
                 },
                 $descriptor_id,
                 $elem_size,
@@ -116,7 +112,14 @@ pub(crate) mod macros {
     /// Forwards to [`super::alloc_captured_data`]. Arguments: (`$ctx`, `$fp`,
     /// `$values_size`, `$descriptor_id`).
     macro_rules! alloc_captured_data {
-        ($ctx:ident, $fp:expr, $values_size:expr, $descriptor_id:expr $(,)?) => {
+        (
+            $ctx:ident,
+            $fp:expr,
+            $pc:expr,
+            $func:expr,
+            $values_size:expr,
+            $descriptor_id:expr $(,)?
+        ) => {
             $crate::heap::alloc_captured_data(
                 &mut $ctx.heap,
                 $ctx.exec_ctx,
@@ -125,8 +128,8 @@ pub(crate) mod macros {
                 $ctx.exec_ctx.extensions(),
                 $fp,
                 $crate::heap::TopFrame::Function {
-                    func: $ctx.current_func,
-                    pc: $ctx.pc,
+                    func: $func,
+                    pc: $pc,
                 },
                 $values_size,
                 $descriptor_id,
@@ -141,6 +144,8 @@ pub(crate) mod macros {
         (
             $ctx:ident,
             $fp:expr,
+            $pc:expr,
+            $func:expr,
             $vec_ref_offset:expr,
             $elem_size:expr,
             $required_cap_in_elems:expr $(,)?
@@ -152,8 +157,8 @@ pub(crate) mod macros {
                 &$ctx.root_pool,
                 $ctx.exec_ctx.extensions(),
                 $crate::heap::TopFrame::Function {
-                    func: $ctx.current_func,
-                    pc: $ctx.pc,
+                    func: $func,
+                    pc: $pc,
                 },
                 $fp,
                 $vec_ref_offset,
@@ -166,17 +171,17 @@ pub(crate) mod macros {
 
     /// Forwards to [`super::gc_collect`]. Arguments: (`$ctx`,).
     macro_rules! gc_collect {
-        ($ctx:ident $(,)?) => {
+        ($ctx:ident, $fp:expr, $pc:expr, $func:expr $(,)?) => {
             $crate::heap::gc_collect(
                 &mut $ctx.heap,
                 $ctx.exec_ctx,
                 &mut $ctx.read_write_set,
                 &$ctx.root_pool,
                 $ctx.exec_ctx.extensions(),
-                $ctx.frame_ptr,
+                $fp,
                 $crate::heap::TopFrame::Function {
-                    func: $ctx.current_func,
-                    pc: $ctx.pc,
+                    func: $func,
+                    pc: $pc,
                 },
             )
         };
@@ -232,6 +237,29 @@ impl Heap {
             buffer,
             gc_count: 0,
         }
+    }
+
+    /// Rewinds the bump pointer to the start of the buffer, discarding all allocations. The buffer
+    /// is retained (no reallocation), so it's the cheap way to reuse one heap across runs.
+    ///
+    /// The caller must ensure no live references into the heap remain (reset the interpreter's frame
+    /// and root set first, via [`InterpreterContext::reset`](crate::InterpreterContext::reset)).
+    pub fn reset(&mut self) {
+        self.bump_ptr = self.buffer.as_ptr();
+        self.gc_count = 0;
+    }
+
+    /// Bump-allocates one object of `total_size` bytes (header + payload), stamps the header with
+    /// `descriptor_id`, and returns the data pointer (payload start; the header occupies the
+    /// preceding [`OBJECT_HEADER_SIZE`](mono_move_core::OBJECT_HEADER_SIZE) bytes). Returns `None` if
+    /// the heap is full. Does not run GC.
+    pub fn alloc_object(
+        &mut self,
+        total_size: usize,
+        descriptor_id: DescriptorId,
+    ) -> Option<std::ptr::NonNull<u8>> {
+        let ptr = heap_alloc(self, total_size, descriptor_id).ok()?;
+        std::ptr::NonNull::new(ptr)
     }
 }
 
@@ -697,7 +725,7 @@ pub(crate) fn grow_vec_ref<P: DescriptorProvider + ?Sized>(
 
 /// Identifies the top stack frame for GC root scanning.
 //
-// TODO: revisit whether this enum is the cleanest representation.
+// TODO(cleanup): revisit whether this enum is the cleanest representation.
 #[derive(Clone, Copy)]
 pub(crate) enum TopFrame<'a> {
     /// A regular Move function frame; `pc` selects the safe-point supplement.
@@ -814,7 +842,7 @@ pub(crate) fn gc_collect<P: DescriptorProvider + ?Sized>(
 
     // Phase 1d: native extension roots.
     //
-    // TODO(correctness, security): a native holding an extension borrow across an
+    // TODO(correctness): a native holding an extension borrow across an
     // allocation makes this a hard error; revisit how to guarantee exclusive
     // access here (e.g. relocating only the disjoint root set).
     unsafe {

@@ -68,7 +68,7 @@ struct Output {
 /// A [`StateStorageView`] over empty storage that serves a fixed usage, for
 /// exercising the legacy `state_storage` native in the differential tests.
 //
-// TODO: replace with a real state view if tests need natives that read actual
+// TODO(testing): replace with a real state view if tests need natives that read actual
 // stored state.
 struct MockEmptyStateStorage {
     usage: StateStorageUsage,
@@ -130,7 +130,7 @@ fn render_execution_output(vals: &[String], events: &[String]) -> String {
 
 /// Renders the events emitted into the legacy VM's [`NativeEventContext`], in
 /// emission order, for cross-VM comparison.
-fn finalize_events_v1(extensions: &NativeContextExtensions) -> Vec<String> {
+pub fn finalize_events_v1(extensions: &NativeContextExtensions) -> Vec<String> {
     extensions
         .get::<NativeEventContext>()
         .events_iter()
@@ -157,7 +157,7 @@ fn finalize_events_v1(extensions: &NativeContextExtensions) -> Vec<String> {
 ///
 /// The VM heap must be live: each entry's `msg_data` embeds heap pointers that
 /// [`serialize`] dereferences.
-unsafe fn finalize_events_v2(
+pub unsafe fn finalize_events_v2(
     extensions: &NativeExtensions,
     layouts: &ExecutionGuard<'_>,
 ) -> Vec<String> {
@@ -419,7 +419,7 @@ fn execute_function_v1(
         &mut traversal_context,
         &ModuleId::new(*address, module_name.to_owned()),
         function_name,
-        // TODO: support type arguments.
+        // TODO(completeness): support type arguments.
         &[],
     ) {
         Ok(function) => function,

@@ -19,6 +19,7 @@ members = [
     "aptos-move/aptos-memory-usage-tracker",
     "aptos-move/aptos-native-interface",
     "aptos-move/aptos-release-builder",
+    "aptos-move/aptos-release-tool",
     "aptos-move/aptos-resource-viewer",
     "aptos-move/aptos-sdk-builder",
     "aptos-move/aptos-transaction-benchmarks",
@@ -214,6 +215,7 @@ members = [
     "third_party/move/mono-move/loader",
     "third_party/move/mono-move/natives",
     "third_party/move/mono-move/orchestrator",
+    "third_party/move/mono-move/replay-benchmark",
     "third_party/move/mono-move/runtime",
     "third_party/move/mono-move/specializer",
     "third_party/move/mono-move/testsuite",
@@ -440,6 +442,7 @@ aptos-protos = { path = "protos/rust" }
 aptos-proxy = { path = "crates/proxy" }
 aptos-push-metrics = { path = "crates/aptos-push-metrics" }
 aptos-release-builder = { path = "aptos-move/aptos-release-builder" }
+aptos-release-tool = { path = "aptos-move/aptos-release-tool" }
 aptos-release-bundle = { path = "aptos-move/framework/release-bundle" }
 aptos-reliable-broadcast = { path = "crates/reliable-broadcast" }
 aptos-replay-benchmark = { path = "aptos-move/replay-benchmark" }
@@ -548,6 +551,7 @@ blst = "0.3.15"
 # The __private_bench feature exposes the Fp12 type which we need to implement a multi-threaded multi-pairing.
 blstrs = { version = "0.7.1", features = ["serde", "__private_bench"] }
 bollard = "0.15"
+bon = "3.9.3"
 boxcar = "0.2.13"
 build_html = "2.5.0"
 bulletproofs = { version = "4.0.0" }
@@ -689,7 +693,7 @@ libfuzzer-sys = "0.4.6"
 libsecp256k1 = "0.7.0"
 libtest-mimic = "0.5.2"
 log = "0.4.17"
-lru = "0.16.1"
+lru = "0.18.0"
 lz4 = "1.28.0"
 maplit = "1.0.2"
 memchr = "2.7.4"

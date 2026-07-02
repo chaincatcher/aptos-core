@@ -10,7 +10,7 @@ use thiserror::Error;
 
 /// Version of the read value (which can come from storage or from other
 /// transaction write).
-// TODO:
+// TODO(completeness):
 //   Replace with Block-STM transaction index and incarnation pair.
 pub type Version = u64;
 
@@ -46,6 +46,8 @@ pub enum InMemoryStorageKey {
         handle: TableHandle,
         // TODO(perf): consider interning these keys later.
         key: Box<[u8]>,
+        /// The stored value's type, needed to materialize the item from storage.
+        value_ty: InternedType,
     },
 }
 
@@ -55,9 +57,13 @@ impl InMemoryStorageKey {
         InMemoryStorageKey::Resource { address, ty }
     }
 
-    /// Builds a table item key from its handle and the serialized key bytes.
-    pub fn table_item(handle: TableHandle, key: Box<[u8]>) -> Self {
-        InMemoryStorageKey::TableItem { handle, key }
+    /// Builds a table item key from its handle, serialized key bytes, and stored value type.
+    pub fn table_item(handle: TableHandle, key: Box<[u8]>, value_ty: InternedType) -> Self {
+        InMemoryStorageKey::TableItem {
+            handle,
+            key,
+            value_ty,
+        }
     }
 
     /// Returns the address a key is anchored at: the publishing address for a
@@ -100,13 +106,13 @@ pub enum StorageRead {
     DoesNotExist,
     /// Value is allocated in some other arena or cache. For example, it can be
     /// a cached DB read or a write from soe transaction at lower version.
-    // TODO(safety):
+    // TODO(cleanup):
     //   Figure out how to enforce compile-time guarantees here that owning
     //   arena is alive.
     ExternalHeap {
         /// Just like any other VM value, the pointer points to the start of
         /// the value allocation. Value's header is at negative offset.
-        // TODO(refactor): have a Value pointer unified API?
+        // TODO(cleanup): have a Value pointer unified API?
         ptr: NonNull<u8>,
         /// Version of this read from Block-STM. Used for read-set validation.
         version: Version,
@@ -138,7 +144,7 @@ impl ResourceProvider for NoResourceProvider {
     }
 }
 
-// TODO(test):
+// TODO(testing):
 //   This is only needed to make current tests work. Remove once specializer can emit
 //   struct / enum operations or when testing framework is unified.
 pub static NO_RESOURCE_PROVIDER: NoResourceProvider = NoResourceProvider;

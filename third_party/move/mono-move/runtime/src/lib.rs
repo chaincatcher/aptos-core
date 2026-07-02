@@ -18,6 +18,7 @@ mod verifier;
 
 pub use error::{RuntimeError, RuntimeStatus};
 pub use execution_context::{ExecutionContext, LocalExecutionContext};
+pub use heap::Heap;
 pub use interpreter::InterpreterContext;
 pub use local_runtime_context::LocalRuntimeContext;
 pub use memory::{
@@ -33,6 +34,6 @@ pub use native_context::{
     ProductionNativeRegistry,
 };
 pub use transaction_context::TransactionContext;
-pub use types::{StepResult, VEC_DATA_OFFSET, VEC_LENGTH_OFFSET};
-pub use value_utils::serialize;
+pub use types::{VEC_DATA_OFFSET, VEC_LENGTH_OFFSET};
+pub use value_utils::{deserialize_into, serialize};
 pub use verifier::{verify_function, verify_program, VerificationError};

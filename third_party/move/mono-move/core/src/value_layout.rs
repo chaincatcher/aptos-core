@@ -15,10 +15,9 @@
 //! are deep and built on demand. They meet at one point: a [`LayoutKind::Vector`]
 //! carries the [`DescriptorId`] so that deserialization can add it to the value
 //! header.
-//! TODO: We will need descriptor IDs for non-inline structs and enums later.
 
 use crate::{
-    types::{view_type, InternedType, Type},
+    types::{intrinsic_slot_size_and_align, view_type, Alignment, InternedType, Size, Type},
     DescriptorId, MAX_ALIGN,
 };
 use bitflags::bitflags;
@@ -97,7 +96,7 @@ pub enum LayoutKind {
     /// An `address` or `signer` (32 bytes).
     Address,
     /// An inline struct: fields laid out flat in the parent's payload.
-    /// TODO: for non-inline structs, we need a descriptor ID.
+    /// TODO(completeness): for non-inline structs (resources), we need a descriptor ID.
     Struct {
         /// Byte offsets and IDs of each field within the struct payload.
         fields: Box<[FieldValueLayout]>,
@@ -113,8 +112,7 @@ pub enum LayoutKind {
     /// pointing at an enum object. Each variant body has its own published
     /// layout, which may itself contain enums, vectors, or structs.
     ///
-    /// TODO: today only frozen (non-upgradable) enums get this layout. Use it
-    /// for all enums once the upgrade story is finalized.
+    /// TODO(completeness): revisit with upgrade story, might not need to be frozen.
     FrozenEnum {
         descriptor_id: DescriptorId,
         /// One layout per variant body, indexed by variant tag.
@@ -478,6 +476,16 @@ pub trait LayoutProvider {
         let id = self.layout_id(ty)?;
         self.layout(id)
     }
+
+    /// In-memory size and alignment of a value of type `ty`. Intrinsic shapes
+    /// (primitives, references, vectors, functions) resolve without the table;
+    /// nominal types resolve through their published [`ValueLayout`]. Returns
+    /// [`None`] for unresolved type parameters and for nominals whose layout
+    /// has not been published yet.
+    fn size_and_align(&self, ty: InternedType) -> Option<(Size, Alignment)> {
+        intrinsic_slot_size_and_align(view_type(ty))
+            .or_else(|| self.layout_by_ty(ty).map(|l| (l.size, l.align)))
+    }
 }
 
 /// A `LayoutProvider` with no layouts; every lookup returns `None`.
@@ -496,7 +504,7 @@ impl LayoutProvider for NoLayoutProvider {
     }
 }
 
-// TODO: Test-only, remove when local execution context is refactored and removed.
+// TODO(testing): Test-only, remove when local execution context is refactored and removed.
 pub struct ValueLayoutTable {
     table: Vec<ValueLayout>,
     by_ty: HashMap<InternedType, LayoutId>,
