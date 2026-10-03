@@ -9,6 +9,7 @@
 //! compiler-v2 stackless checks, optimizations, file-format generator, and
 //! verifier own all later compilation stages.
 
+use crate::env_pipeline::function_checker::call_access_error;
 use anyhow::{bail, ensure, Context, Result};
 use codespan::Span;
 use move_binary_format::file_format::Visibility as MoveVisibility;
@@ -20,11 +21,13 @@ use move_core_types::{
 };
 use move_model::{
     ast::{Address, Attribute, AttributeValue, ModuleName, Value},
+    metadata::lang_feature_versions::LANGUAGE_VERSION_FOR_PUBLIC_STRUCT,
     model::{
         FieldData, FunId, FunctionKind, GlobalEnv, Loc, ModuleId, Parameter, QualifiedId, StructId,
         TypeParameter, TypeParameterKind,
     },
     ty::{PrimitiveType, ReferenceKind, Type},
+    well_known,
     xir_loader::{
         XirFunctionData as ModelXirFunctionData, XirModuleData as ModelXirModuleData,
         XirStructData as ModelXirStructData, XirVariantData as ModelXirVariantData,
@@ -503,6 +506,48 @@ fn import_source(
         xir.module.address,
         xir.module.name
     );
+    // Move source drops test-only items from a build without test code, and
+    // verify-only items from one without verification code; the file-format
+    // generator asserts the first and silently publishes the second. XIR cannot
+    // drop them. Without compiler options there is no code generation.
+    if let Some(options) = env.get_extension::<crate::Options>() {
+        let modes: [(&str, fn(&str) -> bool, bool, &str); 2] = [
+            (
+                "test-only",
+                well_known::is_test_only_attribute_name,
+                options.compile_test_code,
+                "test code",
+            ),
+            (
+                "verify-only",
+                well_known::is_verify_only_attribute_name,
+                options.compile_verify_code,
+                "verification code",
+            ),
+        ];
+        for (marker, is_marked, included, code) in modes {
+            if included {
+                continue;
+            }
+            let items = xir
+                .structs
+                .iter()
+                .map(|decl| ("struct", &decl.name, &decl.attributes))
+                .chain(
+                    xir.functions
+                        .iter()
+                        .map(|decl| ("function", &decl.name, &decl.attributes)),
+                );
+            for (kind, name, attributes) in items {
+                ensure!(
+                    !attributes
+                        .iter()
+                        .any(|attribute| is_marked(&attribute.name)),
+                    "{kind} `{name}` is {marker}, which a build without {code} cannot include"
+                );
+            }
+        }
+    }
     let file_id = env.add_source(
         FileHash::new(&source.text),
         Rc::new(BTreeMap::new()),
@@ -571,14 +616,51 @@ fn import_source(
                 }
             }
         }
+        // The model's `Attribute` cannot hold a literal inside an argument
+        // list, which Lean's positional grammar allows; warn and skip it.
+        let mut attributes = vec![];
+        for attribute in &decl.attributes {
+            match model_attribute(env, &loc, attribute) {
+                Ok(attribute) => attributes.push(attribute),
+                Err(error) => env.warning(
+                    &loc,
+                    &format!(
+                        "attribute `{}` on struct `{}` is not carried: {error:#}",
+                        attribute.name, decl.name
+                    ),
+                ),
+            }
+        }
+        // The rules the source compiler applies to a struct's visibility: below
+        // the version that has it, a warning, and a resource cannot have it.
+        let abilities = ability_set(decl)?;
+        let visibility = move_visibility(&decl.visibility);
+        if visibility != MoveVisibility::Private {
+            if !env.language_version().language_version_for_public_struct() {
+                env.warning(
+                    &loc,
+                    &format!(
+                        "structs/enums with visibility modifier are only supported at version {} or later",
+                        LANGUAGE_VERSION_FOR_PUBLIC_STRUCT
+                    ),
+                );
+            } else {
+                ensure!(
+                    !abilities.has_ability(Ability::Key),
+                    "struct `{}`: structs/enums with key ability cannot have public, package or friend visibility",
+                    decl.name
+                );
+            }
+        }
         structs.push(ModelXirStructData {
             name: struct_id.symbol(),
             loc: loc.clone(),
-            abilities: ability_set(decl)?,
+            abilities,
             type_parameters: model_type_parameters(env, &loc, &decl.type_parameters)?,
             fields,
             variants,
-            visibility: MoveVisibility::Private,
+            visibility,
+            attributes,
         });
     }
 
@@ -653,6 +735,7 @@ fn import_source(
         added_id == module_id,
         "model assigned an unexpected module id"
     );
+    env.add_package_friends(module_id);
     for (decl, fun_id) in xir.functions.iter().zip(&function_ids) {
         let qid = module_id.qualified(*fun_id);
         let data = translate_function(
@@ -665,6 +748,19 @@ fn import_source(
             decl,
             qid,
         )?;
+        // The call graph is what the translated code calls, including the
+        // calls it lowers operations to.
+        let called = data
+            .code
+            .iter()
+            .filter_map(|bytecode| match bytecode {
+                Bytecode::Call(_, _, StacklessOperation::Function(module, fun, _), _, _) => {
+                    Some(module.qualified(*fun))
+                },
+                _ => None,
+            })
+            .collect();
+        env.set_xir_called_functions(qid, called);
         targets.insert_target_data(&qid, FunctionVariant::Baseline, data);
     }
     add_transitive_callee_targets(env, module_id, targets);
@@ -869,32 +965,13 @@ fn called_functions(
     module_id: ModuleId,
     functions: &[FunId],
 ) -> Result<BTreeSet<QualifiedId<FunId>>> {
+    // The explicit calls; the translated code adds the ones it lowers to.
     let mut called = BTreeSet::new();
-    let mut uses_generic_comparison = false;
     for block in &decl.blocks {
         for instr in &block.instrs {
             if let Instr::Call(_, Oper::Function(id) | Oper::FunctionInst(id, _), _) = instr {
                 called.insert(function_at(env, xir, module_id, functions, *id)?);
             }
-            if let Instr::Call(_, Oper::Lt, srcs) = instr {
-                let source_type = srcs
-                    .first()
-                    .and_then(|id| decl.locals.get(*id))
-                    .with_context(|| format!("malformed comparison in `{}`", decl.name))?;
-                uses_generic_comparison |= !matches!(source_type, Ty::U64);
-            }
-        }
-    }
-    if uses_generic_comparison {
-        let module = env
-            .get_modules()
-            .find(|module| module.is_cmp())
-            .context("generic comparison requires the standard `cmp` module")?;
-        for name in ["compare", "is_lt"] {
-            let function = module
-                .find_function(env.symbol_pool().make(name))
-                .with_context(|| format!("the standard `cmp` module has no `{name}` function"))?;
-            called.insert(module.get_id().qualified(function.get_id()));
         }
     }
     Ok(called)
@@ -931,6 +1008,7 @@ fn translate_function(
         external_struct_ids,
         function_ids,
         decl,
+        qid,
         loc: func_env.get_loc(),
         function_loc: func_env.get_loc(),
         code: vec![],
@@ -1068,6 +1146,8 @@ struct FunctionTranslator<'a> {
     external_struct_ids: &'a [QualifiedId<StructId>],
     function_ids: &'a [FunId],
     decl: &'a FunctionDecl,
+    /// The function being translated.
+    qid: QualifiedId<FunId>,
     loc: Loc,
     function_loc: Loc,
     code: Vec<Bytecode>,
@@ -1531,7 +1611,8 @@ impl FunctionTranslator<'_> {
                     )
                 })
             },
-            Oper::Lt if !self.local(srcs[0])?.is_number() => {
+            // A malformed `<` falls through to the arity check below.
+            Oper::Lt if srcs.len() == 2 && !self.local(srcs[0])?.is_number() => {
                 self.translate_generic_less(dsts, srcs)
             },
             _ => {
@@ -1727,15 +1808,39 @@ impl FunctionTranslator<'_> {
                     self.type_args(args)?,
                 )
             },
-            Oper::Function(id) => {
+            Oper::Function(id) | Oper::FunctionInst(id, _) => {
                 let target =
                     function_at(self.env, self.xir, self.module_id, self.function_ids, *id)?;
-                StacklessOperation::Function(target.module_id, target.id, vec![])
-            },
-            Oper::FunctionInst(id, args) => {
-                let target =
-                    function_at(self.env, self.xir, self.module_id, self.function_ids, *id)?;
-                StacklessOperation::Function(target.module_id, target.id, self.type_args(args)?)
+                let type_args = match oper {
+                    Oper::FunctionInst(_, args) => self.type_args(args)?,
+                    _ => vec![],
+                };
+                let callee = self.env.get_function(target);
+                // Inline functions and lemmas have no bytecode; source calls to
+                // them are expanded before translation, which XIR cannot do.
+                ensure!(
+                    !callee.is_excluded_from_bytecode_gen(),
+                    "{oper:?}: `{}` has no bytecode (an inline function or lemma), so it cannot be called",
+                    callee.get_full_name_with_address()
+                );
+                // The same visibility rule the source compiler applies to calls,
+                // for the same modules: those being compiled. A dependency was
+                // checked in its own build.
+                if self.env.get_module(self.module_id).is_primary_target() {
+                    if let Some((message, _)) =
+                        call_access_error(&self.env.get_function(self.qid), &callee)
+                    {
+                        bail!("{oper:?}: {message}");
+                    }
+                }
+                ensure!(
+                    callee.get_type_parameter_count() == type_args.len(),
+                    "function `{}` takes {} type arguments, but the call supplies {}",
+                    callee.get_full_name_str(),
+                    callee.get_type_parameter_count(),
+                    type_args.len()
+                );
+                StacklessOperation::Function(target.module_id, target.id, type_args)
             },
             Oper::BorrowLoc => {
                 arity(dsts, srcs, 1, 1, oper)?;
@@ -2587,6 +2692,1128 @@ mod tests {
         assert!(matches!(nested[0], Attribute::Apply(_, _, ref args) if args.is_empty()));
     }
 
+    fn import_module(module: &XirModule) -> Result<GlobalEnv> {
+        import_module_with(module, None).map(|(env, _)| env)
+    }
+
+    /// As [`import_module`], with `options` set before the import reads them,
+    /// and keeping the translated targets.
+    fn import_module_with(
+        module: &XirModule,
+        options: Option<&Options>,
+    ) -> Result<(GlobalEnv, FunctionTargetsHolder)> {
+        let source = parse_source(
+            PathBuf::from("test.xir.json"),
+            String::new(),
+            &serde_json::to_string(module).unwrap(),
+        )?;
+        let mut env = GlobalEnv::new();
+        if let Some(options) = options {
+            env.set_extension(options.clone());
+        }
+        let mut targets = FunctionTargetsHolder::default();
+        import_sources(&mut env, &[source], &mut targets)?;
+        Ok((env, targets))
+    }
+
+    /// The names of `name`'s attributes, with nested arguments in brackets.
+    fn struct_attribute_names(env: &GlobalEnv, name: &str) -> Vec<String> {
+        fn render(env: &GlobalEnv, attribute: &Attribute) -> String {
+            let name = env.symbol_pool().string(attribute.name()).to_string();
+            match attribute {
+                Attribute::Apply(_, _, args) if args.is_empty() => name,
+                Attribute::Apply(_, _, args) => format!(
+                    "{name}[{}]",
+                    args.iter()
+                        .map(|arg| render(env, arg))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                Attribute::Assign(_, _, AttributeValue::Value(_, value)) => {
+                    format!("{name}={value:?}")
+                },
+                Attribute::Assign(..) => format!("{name}=?"),
+            }
+        }
+        env.get_module(ModuleId::new(0))
+            .find_struct(env.symbol_pool().make(name))
+            .unwrap()
+            .get_attributes()
+            .iter()
+            .map(|attribute| render(env, attribute))
+            .collect()
+    }
+
+    #[test]
+    fn struct_attributes_reach_the_model() {
+        let mut module = account_module();
+        let annotated = module.structs[0].name.clone();
+        let plain = module.structs[1].name.clone();
+        module.structs[0].attributes = vec![
+            XirAttribute {
+                name: "event".to_owned(),
+                args: vec![],
+            },
+            XirAttribute {
+                name: "count".to_owned(),
+                args: vec![XirAttributeArg::Num {
+                    value: "7".to_owned(),
+                }],
+            },
+            XirAttribute {
+                name: "flag".to_owned(),
+                args: vec![XirAttributeArg::Bool { value: true }],
+            },
+            XirAttribute {
+                name: "lint::skip".to_owned(),
+                args: vec![XirAttributeArg::Name {
+                    name: "needless_mutable_reference".to_owned(),
+                    args: vec![],
+                }],
+            },
+        ];
+        // An enum goes through the same path as a struct; nothing refers to
+        // this one, so adding it disturbs no function.
+        module.structs.push(StructDecl {
+            name: "Tagged".to_owned(),
+            visibility: XirVisibility::Private,
+            abilities: vec!["drop".to_owned()],
+            type_parameters: vec![],
+            fields: vec![],
+            variants: Some(vec![move_model_exchange::Variant {
+                name: "A".to_owned(),
+                fields: vec![],
+            }]),
+            attributes: vec![XirAttribute {
+                name: "event".to_owned(),
+                args: vec![],
+            }],
+        });
+        let env = import_module(&module).unwrap();
+        assert_eq!(struct_attribute_names(&env, &annotated), vec![
+            "event",
+            "count=Number(7)",
+            "flag=Bool(true)",
+            "lint::skip[needless_mutable_reference]",
+        ]);
+        assert_eq!(struct_attribute_names(&env, "Tagged"), vec!["event"]);
+        assert!(struct_attribute_names(&env, &plain).is_empty());
+    }
+
+    /// A literal mid-list (the `attribute_wire_shape` shape) is skipped with a
+    /// warning; the module and the struct's other attributes still load.
+    #[test]
+    fn a_struct_attribute_the_model_cannot_hold_is_skipped_with_a_warning() {
+        let mut module = account_module();
+        let name = module.structs[0].name.clone();
+        module.structs[0].attributes = vec![
+            XirAttribute {
+                name: "resource_group".to_owned(),
+                args: vec![
+                    XirAttributeArg::Name {
+                        name: "scope".to_owned(),
+                        args: vec![XirAttributeArg::Name {
+                            name: "global".to_owned(),
+                            args: vec![],
+                        }],
+                    },
+                    XirAttributeArg::Num {
+                        value: "7".to_owned(),
+                    },
+                    XirAttributeArg::Bool { value: true },
+                ],
+            },
+            XirAttribute {
+                name: "event".to_owned(),
+                args: vec![],
+            },
+        ];
+        let env = import_module(&module).expect("the module still loads");
+        assert_eq!(struct_attribute_names(&env, &name), vec!["event"]);
+        assert!(!env.has_errors());
+        let mut out = codespan_reporting::term::termcolor::Buffer::no_color();
+        env.report_diag(&mut out, codespan_reporting::diagnostic::Severity::Warning);
+        let warnings = String::from_utf8_lossy(&out.into_inner()).to_string();
+        assert!(
+            warnings.contains("attribute `resource_group` on struct")
+                && warnings.contains("not carried"),
+            "{warnings}"
+        );
+    }
+
+    /// A test-only or verify-only struct or function is rejected unless the
+    /// build compiles that code; the file-format generator would otherwise
+    /// assert on a test-only item and publish a verify-only one.
+    #[test]
+    fn test_and_verify_only_items_need_their_build() {
+        let mark = |name: &str| {
+            vec![XirAttribute {
+                name: name.to_owned(),
+                args: vec![],
+            }]
+        };
+        // Imports `module` under `options`, then generates the file format.
+        let compile = |module: &XirModule, options: Options| -> Result<usize> {
+            let (mut env, mut targets) = import_module_with(module, Some(&options))?;
+            crate::run_stackless_bytecode_pipeline(
+                &env,
+                crate::stackless_bytecode_optimization_pipeline(&options),
+                &mut targets,
+            );
+            Ok(crate::run_file_format_gen(&mut env, &targets).len())
+        };
+        let build = |test: bool, verify: bool| Options {
+            compile_test_code: test,
+            compile_verify_code: verify,
+            ..Options::default()
+        };
+        let marked = |attribute: &str, on_struct: bool| {
+            let mut module = account_module();
+            if on_struct {
+                module.structs[0].attributes = mark(attribute);
+            } else {
+                module.functions[1].attributes = mark(attribute);
+            }
+            module
+        };
+        let mut wrong = vec![];
+        // (label, module, kind, the build that excludes it, the build that includes it)
+        for (label, module, kind, without, with) in [
+            (
+                "test_only struct",
+                marked("test_only", true),
+                "struct",
+                build(false, false),
+                build(true, false),
+            ),
+            (
+                "test function",
+                marked("test", false),
+                "function",
+                build(false, false),
+                build(true, false),
+            ),
+            (
+                "verify_only struct",
+                marked("verify_only", true),
+                "struct",
+                build(false, false),
+                build(false, true),
+            ),
+            (
+                "verify_only function",
+                marked("verify_only", false),
+                "function",
+                build(false, false),
+                build(false, true),
+            ),
+            // The two kinds of build are independent.
+            (
+                "verify_only function in a test build",
+                marked("verify_only", false),
+                "function",
+                build(true, false),
+                build(false, true),
+            ),
+        ] {
+            match compile(&module, without) {
+                Err(error) if format!("{error:#}").contains(&format!("{kind} `")) => {},
+                result => wrong.push(format!("{label}, excluded: {result:?}")),
+            }
+            if let Err(error) = compile(&module, with) {
+                wrong.push(format!("{label}, included: {error:#}"));
+            }
+        }
+        if let Err(error) = compile(&account_module(), build(false, false)) {
+            wrong.push(format!("the golden module: {error:#}"));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A copy of the golden module whose first function is replaced by one
+    /// with a single instruction and these locals:
+    /// l0-l2 `u64`, l3 `u8`, l4 `address`, l5 `u16`, l6 `u32`, l7 `u128`,
+    /// l8 `u256`, l9 `bool`, l10 `vector<u64>`, l11 `&u64`, l12 a struct.
+    fn instruction_module(instr: Instr) -> XirModule {
+        let mut module = account_module();
+        let function = &mut module.functions[0];
+        function.params = 0;
+        function.locals = vec![
+            Ty::U64,
+            Ty::U64,
+            Ty::U64,
+            Ty::U8,
+            Ty::Address,
+            Ty::U16,
+            Ty::U32,
+            Ty::U128,
+            Ty::U256,
+            Ty::Bool,
+            Ty::Vector(Box::new(Ty::U64)),
+            Ty::Ref(Box::new(Ty::U64)),
+            Ty::Struct(0),
+        ];
+        function.local_names = vec![];
+        function.returns = vec![];
+        function.source_map = None;
+        function.entry = 0;
+        function.blocks = vec![Block {
+            instrs: vec![instr],
+            term: Term::Ret(vec![]),
+        }];
+        module
+    }
+
+    fn load_instruction(instr: Instr) -> Result<()> {
+        import_module(&instruction_module(instr)).map(|_| ())
+    }
+
+    /// `<` on an integer is a native comparison and loads without the
+    /// standard library; on any other type it is lowered through `std::cmp`.
+    #[test]
+    fn only_a_non_integer_less_than_needs_cmp() {
+        let lt = |local| load_instruction(Instr::Call(vec![9], Oper::Lt, vec![local, local]));
+        let mut wrong = vec![];
+        for local in [0, 3, 5, 6, 7, 8] {
+            if let Err(error) = lt(local) {
+                wrong.push(format!("l{local} was rejected: {error:#}"));
+            }
+        }
+        for local in [4, 9, 10, 11, 12] {
+            match lt(local) {
+                Ok(()) => wrong.push(format!("l{local} loaded without `cmp`")),
+                Err(error) if format!("{error:#}").contains("`cmp`") => {},
+                Err(error) => wrong.push(format!("l{local}: {error:#}")),
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// With `std::cmp` loaded, an integer `<` translates to a native `Lt` and
+    /// a non-integer one to a call into `cmp`, and the function's call graph
+    /// agrees with the code. The Move standard library here has no `cmp`, so
+    /// the parts the reader uses are copied from Aptos's.
+    #[test]
+    fn only_a_non_integer_less_than_calls_cmp() {
+        struct TempFile(PathBuf);
+        impl Drop for TempFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let cmp =
+            TempFile(std::env::temp_dir().join(format!("xir_cmp_{}.move", std::process::id())));
+        std::fs::write(
+            &cmp.0,
+            "module std::cmp {
+                enum Ordering has copy, drop { Less, Equal, Greater }
+                native public fun compare<T>(first: &T, second: &T): Ordering;
+                public fun is_lt(self: &Ordering): bool { self is Ordering::Less }
+            }",
+        )
+        .unwrap();
+        let mut dependencies = move_stdlib::move_stdlib_files();
+        dependencies.push(cmp.0.to_string_lossy().into_owned());
+        // Whether the call graph, and the code, call into `cmp`, and whether
+        // the code has a native `Lt`.
+        let translate = |local| -> (bool, bool, bool) {
+            let module = instruction_module(Instr::Call(vec![9], Oper::Lt, vec![local, local]));
+            let options = crate::Options {
+                dependencies: dependencies.clone(),
+                named_address_mapping: vec!["std=0x1".to_owned()],
+                ..crate::Options::default()
+            };
+            let mut env = crate::run_checker(options).unwrap();
+            let source = parse_source(
+                PathBuf::from("test.xir.json"),
+                String::new(),
+                &serde_json::to_string(&module).unwrap(),
+            )
+            .unwrap();
+            let mut targets = FunctionTargetsHolder::default();
+            import_sources(&mut env, &[source], &mut targets).unwrap();
+            let pool = env.symbol_pool();
+            let imported = env
+                .get_modules()
+                .find(|m| m.get_name().name() == pool.make(&module.module.name))
+                .unwrap();
+            let function = imported
+                .find_function(pool.make(&module.functions[0].name))
+                .unwrap();
+            let graph = function
+                .get_called_functions()
+                .unwrap()
+                .iter()
+                .any(|callee| env.get_module(callee.module_id).is_cmp());
+            let target = targets.get_target(&function, &FunctionVariant::Baseline);
+            let calls = |test: &dyn Fn(&StacklessOperation) -> bool| {
+                target
+                    .get_bytecode()
+                    .iter()
+                    .any(|bytecode| matches!(bytecode, Bytecode::Call(_, _, op, _, _) if test(op)))
+            };
+            let code = calls(
+                &|op| matches!(op, StacklessOperation::Function(mid, _, _) if env.get_module(*mid).is_cmp()),
+            );
+            let native = calls(&|op| matches!(op, StacklessOperation::Lt));
+            (graph, code, native)
+        };
+        let mut wrong = vec![];
+        for local in [0, 3, 5, 6, 7, 8] {
+            let outcome = translate(local);
+            if outcome != (false, false, true) {
+                wrong.push(format!(
+                    "integer l{local}: (graph, code, native) = {outcome:?}"
+                ));
+            }
+        }
+        for local in [4, 9, 10, 11, 12] {
+            let outcome = translate(local);
+            if outcome != (true, true, false) {
+                wrong.push(format!(
+                    "non-integer l{local}: (graph, code, native) = {outcome:?}"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// XIR calling into a Move module compiled in the same run, following the
+    /// steps of `run_move_compiler` and reporting after each phase as it does:
+    /// an ordinary function compiles, its warnings reported by the Move checks
+    /// and the XIR function's by the XIR checks; an inline function is rejected.
+    #[test]
+    fn xir_calls_into_move_compiled_in_the_same_run() {
+        struct TempFile(PathBuf);
+        impl Drop for TempFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let math =
+            TempFile(std::env::temp_dir().join(format!("xir_math_{}.move", std::process::id())));
+        std::fs::write(
+            &math.0,
+            "module 0x42::math {
+                public fun plain(a: u64, b: u64): u64 { let x = a; x = b; x }
+                public inline fun max(a: u64, b: u64): u64 { if (a > b) a else b }
+            }",
+        )
+        .unwrap();
+        // The result, and the diagnostics reported after the Move checks and
+        // after the XIR checks.
+        let compile = |callee: &str| -> (Result<usize>, String, String) {
+            let options = Options {
+                sources: vec![math.0.to_string_lossy().into_owned()],
+                dependencies: move_stdlib::move_stdlib_files(),
+                named_address_mapping: vec!["std=0x1".to_owned()],
+                ..Options::default()
+            };
+            let mut env = crate::run_checker(options.clone()).unwrap();
+            crate::env_check_and_transform_pipeline(&options).run(&mut env);
+            let mut targets = crate::run_stackless_bytecode_gen(&env);
+            crate::run_stackless_bytecode_pipeline(
+                &env,
+                crate::stackless_bytecode_check_pipeline(&options),
+                &mut targets,
+            );
+            let report = |env: &GlobalEnv| {
+                let mut out = codespan_reporting::term::termcolor::Buffer::no_color();
+                env.report_diag(&mut out, codespan_reporting::diagnostic::Severity::Warning);
+                String::from_utf8_lossy(&out.into_inner()).to_string()
+            };
+            let move_checks = report(&env);
+            crate::env_optimization_pipeline(&options).run(&mut env);
+            let mut targets = crate::run_stackless_bytecode_gen(&env);
+            let mut module =
+                instruction_module(Instr::Call(vec![2], Oper::Function(1), vec![0, 1]));
+            module.functions[0].params = 2;
+            // The result goes to a named local that is never read, which the
+            // XIR checks report.
+            let locals = module.functions[0].locals.len();
+            module.functions[0].local_names = (0..locals)
+                .map(|local| (local == 2).then(|| "unread".to_owned()))
+                .collect();
+            module.functions.truncate(1);
+            module.external_functions = vec![move_model_exchange::XirExternalFunction {
+                address: "0x42".to_owned(),
+                module: "math".to_owned(),
+                function: callee.to_owned(),
+            }];
+            let source = parse_source(
+                PathBuf::from("calls.xir.json"),
+                String::new(),
+                &serde_json::to_string(&module).unwrap(),
+            )
+            .unwrap();
+            let checked = crate::import_and_check_xir(&mut env, &options, &[source]);
+            let xir_checks = report(&env);
+            let result = checked.map(|mut xir_targets| {
+                crate::merge_xir_targets(&mut targets, &mut xir_targets);
+                crate::run_stackless_bytecode_pipeline(
+                    &env,
+                    crate::stackless_bytecode_optimization_pipeline(&options),
+                    &mut targets,
+                );
+                let units = crate::annotate_units(crate::run_file_format_gen(&mut env, &targets));
+                crate::run_bytecode_verifier(&units, &mut env);
+                units.len()
+            });
+            (result, move_checks, xir_checks)
+        };
+        let (plain, move_checks, xir_checks) = compile("plain");
+        assert!(
+            matches!(plain, Ok(2))
+                && move_checks.contains("`x` is unused")
+                && !xir_checks.contains("`x` is unused")
+                && xir_checks.contains("`unread` is unused"),
+            "{plain:?}\nMove checks:\n{move_checks}\nXIR checks:\n{xir_checks}"
+        );
+        let (max, ..) = compile("max");
+        let error = format!("{:#}", max.unwrap_err());
+        assert!(
+            error.contains("`0x42::math::max` has no bytecode"),
+            "{error}"
+        );
+    }
+
+    /// A call into another module follows the source compiler's visibility
+    /// rule. A package function is callable from the same package, which makes
+    /// the XIR module a friend of the callee, but not from a dependency's.
+    #[test]
+    fn calls_respect_the_callee_visibility() {
+        struct TempFile(PathBuf);
+        impl Drop for TempFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let write = |name: &str, text: &str| {
+            let file = TempFile(
+                std::env::temp_dir()
+                    .join(format!("xir_visibility_{name}_{}.move", std::process::id())),
+            );
+            std::fs::write(&file.0, text).unwrap();
+            file
+        };
+        let callee_text = |module: &str| {
+            format!(
+                "module 0x0::{module} {{
+                    public fun open(): u64 {{ 1 }}
+                    fun closed(): u64 {{ 2 }}
+                    public(package) fun for_package(): u64 {{ 4 }}
+                }}"
+            )
+        };
+        // `package` and `friendly` are compiled with the XIR module (Move does
+        // not allow package and friend functions in one module); `dependency`
+        // is only a dependency, loaded because `user` calls it.
+        let package = write("package", &callee_text("package"));
+        let friendly = write(
+            "friendly",
+            "module 0x0::friendly { public(friend) fun for_friends(): u64 { 3 } }",
+        );
+        let dependency = write("dependency", &callee_text("dependency"));
+        let user = write(
+            "user",
+            "module 0x0::user { public fun f(): u64 { 0x0::dependency::open() } }",
+        );
+        let path = |file: &TempFile| file.0.to_string_lossy().into_owned();
+        let cases = [
+            ("package", "open", None),
+            ("package", "closed", Some("is private to module")),
+            ("friendly", "for_friends", Some("(not a friend of")),
+            ("package", "for_package", None),
+            ("dependency", "open", None),
+            (
+                "dependency",
+                "for_package",
+                Some("cannot be called from a different package"),
+            ),
+        ];
+        let mut wrong = vec![];
+        for (callee, function, expected) in cases {
+            // l0 is a `u64` for the callee's result; the external function's id
+            // follows the module's own two.
+            let mut module = instruction_module(Instr::Call(vec![0], Oper::Function(2), vec![]));
+            module.external_functions = vec![move_model_exchange::XirExternalFunction {
+                address: "0x0".to_owned(),
+                module: callee.to_owned(),
+                function: function.to_owned(),
+            }];
+            // Sources, not dependencies, are always loaded.
+            let options = Options {
+                sources: vec![path(&package), path(&friendly), path(&user)],
+                dependencies: [move_stdlib::move_stdlib_files(), vec![path(&dependency)]].concat(),
+                named_address_mapping: vec!["std=0x1".to_owned()],
+                ..Options::default()
+            };
+            let mut env = crate::run_checker(options.clone()).unwrap();
+            // The stubs must be legal Move, as the source checks judge it.
+            crate::env_check_and_transform_pipeline(&options).run(&mut env);
+            assert!(!env.has_errors(), "the Move stubs do not compile");
+            let source = parse_source(
+                PathBuf::from("visibility.xir.json"),
+                String::new(),
+                &serde_json::to_string(&module).unwrap(),
+            )
+            .unwrap();
+            let result = import_sources(&mut env, &[source], &mut FunctionTargetsHolder::default());
+            match (expected, result) {
+                (None, Ok(())) => {},
+                (Some(fragment), Err(error)) if format!("{error:#}").contains(fragment) => {},
+                (_, result) => wrong.push(format!("`{callee}::{function}`: {result:?}")),
+            }
+            // The compiled callee must name the XIR module as a friend exactly
+            // when the call relies on package visibility.
+            if callee == "package" {
+                let pool = env.symbol_pool();
+                let find = |name: &str| {
+                    env.get_modules()
+                        .find(|m| m.get_name().name() == pool.make(name))
+                        .unwrap()
+                };
+                let friended = find("package").has_friend(&find(&module.module.name).get_id());
+                if friended != (function == "for_package") {
+                    wrong.push(format!("`{callee}::{function}`: friended = {friended}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Calls to functions without bytecode: a native is callable; an inline
+    /// function or a lemma is not, since only source calls get expanded.
+    #[test]
+    fn calls_to_functions_without_bytecode() {
+        struct TempFile(PathBuf);
+        impl Drop for TempFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let helpers = TempFile(
+            std::env::temp_dir().join(format!("xir_no_bytecode_{}.move", std::process::id())),
+        );
+        std::fs::write(
+            &helpers.0,
+            "module 0x0::helpers {
+                public inline fun twice(x: u64): u64 { x + x }
+                spec module {
+                    lemma stays(x: u64) { ensures x == x; }
+                }
+            }",
+        )
+        .unwrap();
+        // (address, module, function, type arguments, destinations, sources,
+        // expected error); l0 and l1 are `u64`, l10 a `vector<u64>`.
+        let cases: [(
+            &str,
+            &str,
+            &str,
+            Vec<Ty>,
+            Vec<usize>,
+            Vec<usize>,
+            Option<&str>,
+        ); 3] = [
+            (
+                "0x1",
+                "vector",
+                "empty",
+                vec![Ty::U64],
+                vec![10],
+                vec![],
+                None,
+            ),
+            (
+                "0x0",
+                "helpers",
+                "twice",
+                vec![],
+                vec![0],
+                vec![1],
+                Some("has no bytecode"),
+            ),
+            (
+                "0x0",
+                "helpers",
+                "stays",
+                vec![],
+                vec![],
+                vec![1],
+                Some("has no bytecode"),
+            ),
+        ];
+        let mut wrong = vec![];
+        for (address, module_name, function, args, dsts, srcs, expected) in cases {
+            let oper = if args.is_empty() {
+                Oper::Function(2)
+            } else {
+                Oper::FunctionInst(2, args)
+            };
+            let mut module = instruction_module(Instr::Call(dsts, oper, srcs));
+            module.external_functions = vec![move_model_exchange::XirExternalFunction {
+                address: address.to_owned(),
+                module: module_name.to_owned(),
+                function: function.to_owned(),
+            }];
+            // A source, not a dependency: unused dependencies are not loaded.
+            let options = Options {
+                sources: vec![helpers.0.to_string_lossy().into_owned()],
+                dependencies: move_stdlib::move_stdlib_files(),
+                named_address_mapping: vec!["std=0x1".to_owned()],
+                ..Options::default()
+            };
+            let mut env = crate::run_checker(options).unwrap();
+            let source = parse_source(
+                PathBuf::from("no_bytecode.xir.json"),
+                String::new(),
+                &serde_json::to_string(&module).unwrap(),
+            )
+            .unwrap();
+            let result = import_sources(&mut env, &[source], &mut FunctionTargetsHolder::default());
+            match (expected, result) {
+                (None, Ok(())) => {},
+                (Some(fragment), Err(error)) if format!("{error:#}").contains(fragment) => {},
+                (_, result) => wrong.push(format!("`{module_name}::{function}`: {result:?}")),
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Compiles `module` through the production stackless and file-format
+    /// pipelines.
+    fn compile_module(module: &XirModule) -> move_binary_format::CompiledModule {
+        let source = parse_source(
+            PathBuf::from("compiled.xir.json"),
+            String::new(),
+            &serde_json::to_string(module).unwrap(),
+        )
+        .unwrap();
+        let mut env = GlobalEnv::new();
+        let mut targets = FunctionTargetsHolder::default();
+        import_sources(&mut env, &[source], &mut targets).unwrap();
+        let options = Options::default();
+        env.set_extension(options.clone());
+        crate::run_stackless_bytecode_pipeline(
+            &env,
+            crate::stackless_bytecode_optimization_pipeline(&options),
+            &mut targets,
+        );
+        let units = crate::run_file_format_gen(&mut env, &targets);
+        assert!(!env.has_errors());
+        let legacy_move_compiler::compiled_unit::CompiledUnit::Module(unit) = &units[0] else {
+            panic!("expected module")
+        };
+        unit.module.clone()
+    }
+
+    /// A struct's visibility reaches the model; a document without the field,
+    /// written before version 7, reads as private.
+    #[test]
+    fn struct_visibility_reaches_the_model() {
+        let visibility = |module: &XirModule| {
+            let env = import_module(module).unwrap();
+            let name = env.symbol_pool().make(&module.structs[0].name);
+            env.get_module(ModuleId::new(0))
+                .find_struct(name)
+                .unwrap()
+                .get_visibility()
+        };
+        let mut wrong = vec![];
+        for (xir, model) in [
+            (XirVisibility::Private, MoveVisibility::Private),
+            (XirVisibility::Public, MoveVisibility::Public),
+            (XirVisibility::Friend, MoveVisibility::Friend),
+        ] {
+            let mut module = account_module();
+            module.version = move_model_exchange::XIR_VERSION;
+            module.structs[0].visibility = xir;
+            if visibility(&module) != model {
+                wrong.push(format!("{xir:?} did not arrive as {model:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        // A version 6 document has no `visibility` on its structs.
+        let mut json = serde_json::to_value({
+            let mut module = account_module();
+            module.version = 6;
+            module.structs[0].visibility = XirVisibility::Public;
+            module
+        })
+        .unwrap();
+        json["structs"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("visibility")
+            .unwrap();
+        let module: XirModule = serde_json::from_value(json).unwrap();
+        assert_eq!(visibility(&module), MoveVisibility::Private);
+    }
+
+    /// As in Move source, a resource cannot be public or friend.
+    #[test]
+    fn a_resource_cannot_be_public_or_friend() {
+        let mut wrong = vec![];
+        // Struct 1, `Balance`, has `key`; struct 0 does not.
+        for (index, visibility, rejected) in [
+            (1, XirVisibility::Public, true),
+            (1, XirVisibility::Friend, true),
+            (1, XirVisibility::Private, false),
+            (0, XirVisibility::Public, false),
+        ] {
+            let mut module = account_module();
+            module.version = move_model_exchange::XIR_VERSION;
+            module.structs[index].visibility = visibility;
+            match (rejected, import_module(&module)) {
+                (false, Ok(_)) => {},
+                (true, Err(error))
+                    if format!("{error:#}").contains("key ability cannot have public") => {},
+                (_, result) => wrong.push(format!(
+                    "struct {index} {visibility:?}: {:?}",
+                    result.map(|_| ())
+                )),
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[test]
+    fn struct_visibility_needs_its_language_version() {
+        let mut module = account_module();
+        module.version = move_model_exchange::XIR_VERSION;
+        module.structs[1].visibility = XirVisibility::Public;
+        let source = parse_source(
+            PathBuf::from("old.xir.json"),
+            String::new(),
+            &serde_json::to_string(&module).unwrap(),
+        )
+        .unwrap();
+        let mut env = GlobalEnv::new();
+        env.set_language_version(move_model::metadata::LanguageVersion::V2_3);
+        import_sources(&mut env, &[source], &mut FunctionTargetsHolder::default()).unwrap();
+        let mut out = codespan_reporting::term::termcolor::Buffer::no_color();
+        env.report_diag(&mut out, codespan_reporting::diagnostic::Severity::Warning);
+        let warnings = String::from_utf8_lossy(&out.into_inner()).to_string();
+        assert!(
+            warnings.contains("visibility modifier are only supported at version"),
+            "{warnings}"
+        );
+    }
+
+    /// A public struct gets the pack, unpack and field functions other modules
+    /// use; before version 7 the reader made every struct private and they
+    /// were not generated.
+    #[test]
+    fn a_public_struct_gets_its_generated_functions() {
+        let functions = |visibility| {
+            let mut module = account_module();
+            module.version = move_model_exchange::XIR_VERSION;
+            module.structs[0].visibility = visibility;
+            compile_module(&module).function_defs.len()
+        };
+        let private = functions(XirVisibility::Private);
+        let public = functions(XirVisibility::Public);
+        assert!(public > private, "private: {private}, public: {public}");
+    }
+
+    /// The call graph is exactly what the translated code calls, including the
+    /// library calls operations are lowered to. Locals: l0-l2 `u64`, l4
+    /// `address`, l9 `bool`, l10 `vector<u64>`.
+    #[test]
+    fn the_call_graph_matches_the_translated_code() {
+        struct TempFile(PathBuf);
+        impl Drop for TempFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let cmp = TempFile(
+            std::env::temp_dir().join(format!("xir_graph_cmp_{}.move", std::process::id())),
+        );
+        std::fs::write(
+            &cmp.0,
+            "module std::cmp {
+                enum Ordering has copy, drop { Less, Equal, Greater }
+                native public fun compare<T>(first: &T, second: &T): Ordering;
+                public fun is_lt(self: &Ordering): bool { self is Ordering::Less }
+            }",
+        )
+        .unwrap();
+        let cases: [(&str, Instr, &[&str]); 10] = [
+            ("vec_len", Instr::Call(vec![0], Oper::VecLen, vec![10]), &[
+                "vector::length",
+            ]),
+            (
+                "vec_get",
+                Instr::Call(vec![0], Oper::VecGet, vec![10, 1]),
+                &["vector::borrow"],
+            ),
+            (
+                "vec_set",
+                Instr::Call(vec![10], Oper::VecSet, vec![10, 1, 2]),
+                &["vector::borrow_mut"],
+            ),
+            (
+                "vec_push",
+                Instr::Call(vec![10], Oper::VecPush, vec![10, 1]),
+                &["vector::push_back"],
+            ),
+            (
+                "vec_pop",
+                Instr::Call(vec![10, 0], Oper::VecPop, vec![10]),
+                &["vector::pop_back"],
+            ),
+            (
+                "vec_insert",
+                Instr::Call(vec![10], Oper::VecInsert, vec![10, 1, 2]),
+                &["vector::push_back", "vector::swap"],
+            ),
+            (
+                "vec_remove",
+                Instr::Call(vec![10, 0], Oper::VecRemove, vec![10, 1]),
+                &["vector::swap", "vector::pop_back"],
+            ),
+            (
+                "vec_swap",
+                Instr::Call(vec![10], Oper::VecSwap, vec![10, 1, 2]),
+                &["vector::swap"],
+            ),
+            ("integer lt", Instr::Call(vec![9], Oper::Lt, vec![0, 1]), &[
+            ]),
+            ("address lt", Instr::Call(vec![9], Oper::Lt, vec![4, 4]), &[
+                "cmp::compare",
+                "cmp::is_lt",
+            ]),
+        ];
+        let mut wrong = vec![];
+        for (label, instr, expected) in cases {
+            let mut module = instruction_module(instr);
+            module.functions[0].params = 13;
+            let options = Options {
+                dependencies: [move_stdlib::move_stdlib_files(), vec![cmp
+                    .0
+                    .to_string_lossy()
+                    .into_owned()]]
+                .concat(),
+                named_address_mapping: vec!["std=0x1".to_owned()],
+                ..Options::default()
+            };
+            let mut env = crate::run_checker(options).unwrap();
+            let source = parse_source(
+                PathBuf::from("graph.xir.json"),
+                String::new(),
+                &serde_json::to_string(&module).unwrap(),
+            )
+            .unwrap();
+            let mut targets = FunctionTargetsHolder::default();
+            if let Err(error) = import_sources(&mut env, &[source], &mut targets) {
+                wrong.push(format!("{label}: {error:#}"));
+                continue;
+            }
+            let pool = env.symbol_pool();
+            let function = env
+                .get_modules()
+                .find(|m| m.get_name().name() == pool.make(&module.module.name))
+                .unwrap()
+                .find_function(pool.make(&module.functions[0].name))
+                .unwrap();
+            let name = |id: QualifiedId<FunId>| env.get_function(id).get_full_name_str();
+            let graph: BTreeSet<String> = function
+                .get_called_functions()
+                .unwrap()
+                .iter()
+                .map(|id| name(*id))
+                .collect();
+            let target = targets.get_target(&function, &FunctionVariant::Baseline);
+            let code: BTreeSet<String> = target
+                .get_bytecode()
+                .iter()
+                .filter_map(|bytecode| match bytecode {
+                    Bytecode::Call(_, _, StacklessOperation::Function(m, f, _), _, _) => {
+                        Some(name(m.qualified(*f)))
+                    },
+                    _ => None,
+                })
+                .collect();
+            // The transitive-callee targets and the pipelines read the used set.
+            let used: BTreeSet<String> = function
+                .get_used_functions()
+                .unwrap()
+                .iter()
+                .map(|id| name(*id))
+                .collect();
+            let expected: BTreeSet<String> = expected.iter().map(|s| s.to_string()).collect();
+            if graph != code || used != code || !expected.is_subset(&code) {
+                wrong.push(format!(
+                    "{label}: called {graph:?}, used {used:?}, code {code:?}"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A vector operation in XIR lowers to a call the Move code of the same
+    /// compilation may also make. The callee's target is then in both target
+    /// holders, and merging them keeps the Move pipeline's.
+    #[test]
+    fn xir_and_move_calling_the_same_vector_function_merge() {
+        struct TempFile(PathBuf);
+        impl Drop for TempFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let source = TempFile(
+            std::env::temp_dir().join(format!("xir_vector_user_{}.move", std::process::id())),
+        );
+        std::fs::write(
+            &source.0,
+            "module 0x99::m { public fun f(v: &vector<u64>): u64 { std::vector::length(v) } }",
+        )
+        .unwrap();
+        let options = Options {
+            sources: vec![source.0.to_string_lossy().into_owned()],
+            dependencies: move_stdlib::move_stdlib_files(),
+            named_address_mapping: vec!["std=0x1".to_owned()],
+            ..Options::default()
+        };
+        let mut env = crate::run_checker(options).unwrap();
+        let mut targets = crate::run_stackless_bytecode_gen(&env);
+        let mut module = instruction_module(Instr::Call(vec![0], Oper::VecLen, vec![10]));
+        module.functions[0].params = 13;
+        let xir = parse_source(
+            PathBuf::from("vector.xir.json"),
+            String::new(),
+            &serde_json::to_string(&module).unwrap(),
+        )
+        .unwrap();
+        let mut xir_targets = FunctionTargetsHolder::default();
+        import_sources(&mut env, &[xir], &mut xir_targets).unwrap();
+        let length = env
+            .get_modules()
+            .find(|m| m.is_std_vector())
+            .unwrap()
+            .find_function(env.symbol_pool().make("length"))
+            .unwrap()
+            .get_qualified_id();
+        assert!(
+            targets.get_funs().any(|id| id == length)
+                && xir_targets.get_funs().any(|id| id == length),
+            "both holders have `vector::length`"
+        );
+        crate::merge_xir_targets(&mut targets, &mut xir_targets);
+        assert_eq!(targets.get_funs().filter(|id| *id == length).count(), 1);
+    }
+
+    /// A `<` without its two operands is an error, not a panic.
+    #[test]
+    fn a_malformed_less_than_is_an_error() {
+        let mut wrong = vec![];
+        for srcs in [vec![], vec![0], vec![0, 1, 2]] {
+            let result = std::panic::catch_unwind(|| {
+                load_instruction(Instr::Call(vec![9], Oper::Lt, srcs.clone()))
+            });
+            match result {
+                Ok(Err(error)) if format!("{error:#}").contains("sources") => {},
+                other => wrong.push(format!("{srcs:?}: {other:?}")),
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// As in the source compiler, package visibility applies only to modules
+    /// being compiled: their calls are checked and they become package
+    /// friends. A dependency was checked in its own build, and is never a
+    /// friend of the package, even in whole-program mode, where every module
+    /// counts as a target.
+    #[test]
+    fn package_rules_apply_only_to_modules_being_compiled() {
+        struct TempFile(PathBuf);
+        impl Drop for TempFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let write = |name: &str, text: &str| {
+            let file = TempFile(
+                std::env::temp_dir()
+                    .join(format!("xir_package_{name}_{}.move", std::process::id())),
+            );
+            std::fs::write(&file.0, text).unwrap();
+            file
+        };
+        // `package` is compiled; `library` is a dependency of another package
+        // at the same address, kept loaded because `user` calls it.
+        let package = write(
+            "package",
+            "module 0x0::package { public(package) fun for_package(): u64 { 4 } }",
+        );
+        let library = write(
+            "library",
+            "module 0x0::library {
+                public fun open(): u64 { 1 }
+                public(package) fun for_package(): u64 { 4 }
+            }",
+        );
+        let user = write(
+            "user",
+            "module 0x0::user { public fun f(): u64 { 0x0::library::open() } }",
+        );
+        let path = |file: &TempFile| file.0.to_string_lossy().into_owned();
+        // (case, callee module, whole program)
+        let cases = [
+            ("a dependency calls its own package", "library", false),
+            ("a dependency calls into the package", "package", false),
+            ("whole program", "package", true),
+        ];
+        let mut wrong = vec![];
+        for (case, callee, whole_program) in cases {
+            let options = Options {
+                sources: vec![path(&package), path(&user)],
+                dependencies: [move_stdlib::move_stdlib_files(), vec![path(&library)]].concat(),
+                named_address_mapping: vec!["std=0x1".to_owned()],
+                ..Options::default()
+            };
+            let mut env = crate::run_checker(options).unwrap();
+            if whole_program {
+                env.treat_everything_as_target(true);
+            }
+            let mut module = instruction_module(Instr::Call(vec![0], Oper::Function(2), vec![]));
+            module.external_functions = vec![move_model_exchange::XirExternalFunction {
+                address: "0x0".to_owned(),
+                module: callee.to_owned(),
+                function: "for_package".to_owned(),
+            }];
+            // Loaded as a dependency, not a target.
+            let source = parse_source_with_target(
+                PathBuf::from("dependency.xir.json"),
+                String::new(),
+                &serde_json::to_string(&module).unwrap(),
+                false,
+            )
+            .unwrap();
+            if let Err(error) =
+                import_sources(&mut env, &[source], &mut FunctionTargetsHolder::default())
+            {
+                wrong.push(format!("{case}: {error:#}"));
+                continue;
+            }
+            let pool = env.symbol_pool();
+            let find = |name: &str| {
+                env.get_modules()
+                    .find(|m| m.get_name().name() == pool.make(name))
+                    .unwrap()
+            };
+            if find(callee).has_friend(&find(&module.module.name).get_id()) {
+                wrong.push(format!(
+                    "{case}: the dependency was made a friend of `{callee}`"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     #[test]
     fn source_map_locations_reach_stackless_bytecode() {
         let mut module = account_module();
@@ -2940,6 +4167,28 @@ mod tests {
         let mut targets = FunctionTargetsHolder::default();
         let error = import_sources(&mut env, &[source], &mut targets).unwrap_err();
         assert!(format!("{error:#}").contains("invalid address constant `not-an-address`"));
+    }
+
+    #[test]
+    fn rejects_call_with_wrong_type_argument_count() {
+        let mut module = account_module();
+        module.functions[1].type_parameters = vec![move_model_exchange::TypeParameter {
+            name: "T".to_string(),
+            abilities: vec![],
+            phantom: false,
+        }];
+        module.functions[0].blocks[0].instrs[0] =
+            Instr::Call(vec![], Oper::Function(1), vec![0, 1]);
+        let source = parse_source(
+            PathBuf::from("type-arguments.xir.json"),
+            String::new(),
+            &serde_json::to_string(&module).unwrap(),
+        )
+        .unwrap();
+        let mut env = GlobalEnv::new();
+        let mut targets = FunctionTargetsHolder::default();
+        let error = import_sources(&mut env, &[source], &mut targets).unwrap_err();
+        assert!(format!("{error:#}").contains("takes 1 type arguments, but the call supplies 0"));
     }
 
     #[test]

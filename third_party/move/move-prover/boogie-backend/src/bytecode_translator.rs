@@ -976,29 +976,80 @@ impl<'env> BoogieTranslator<'env> {
                 })
                 .collect()
         };
+        // Captures compare fieldwise when raw equality is not Move equality for them.
         let any_ghost_capture = closure_infos.iter().any(|info| {
             capture_tys(info)
                 .iter()
-                .any(|ty| type_has_ghost_transitively(self.env, ty))
+                .any(|ty| !has_native_equality(self.env, self.options, ty))
         });
-        if !any_ghost_capture {
-            emitln!(
-                self.writer,
-                "function {{:inline}} $IsEqual'{}'(v1: {}, v2: {}): bool {{ v1 == v2 }}",
-                boogie_type_suffix(self.env, fun_type, false),
-                fun_ty_boogie_name,
-                fun_ty_boogie_name,
-            );
+        // Parameters and struct fields have no known identity: two of them, or one and a
+        // closure, may hold the same function value although their constructors differ.
+        let suffix = boogie_type_suffix(self.env, fun_type, false);
+        let unknown_variants: Vec<String> =
+            fun_param_infos
+                .iter()
+                .map(|info| boogie_fun_param_name(self.env, &info.fun, info.param_sym))
+                .chain(struct_field_infos.iter().map(|info| {
+                    boogie_struct_field_name(self.env, &info.struct_id, info.field_sym)
+                }))
+                .collect();
+        let may_be_equal = if unknown_variants.is_empty() {
+            String::new()
         } else {
             emitln!(
                 self.writer,
-                "function {{:inline}} $IsEqual'{}'(v1: {}, v2: {}): bool {{",
-                boogie_type_suffix(self.env, fun_type, false),
+                "function $IsEqualUnknown'{}'(v1: {}, v2: {}): bool;",
+                suffix,
                 fun_ty_boogie_name,
                 fun_ty_boogie_name,
             );
-            self.writer.indent();
-            let mut sep = "";
+            let symmetry = format!(
+                "axiom (forall v1: {t}, v2: {t} :: {{$IsEqualUnknown'{s}'(v1, v2)}} \
+                 $IsEqualUnknown'{s}'(v1, v2) == $IsEqualUnknown'{s}'(v2, v1));",
+                t = fun_ty_boogie_name,
+                s = suffix,
+            );
+            let transitivity = format!(
+                "axiom (forall v1: {t}, v2: {t}, v3: {t} :: \
+                 {{$IsEqualUnknown'{s}'(v1, v2), $IsEqualUnknown'{s}'(v2, v3)}} \
+                 $IsEqualUnknown'{s}'(v1, v2) && $IsEqualUnknown'{s}'(v2, v3) \
+                 ==> $IsEqualUnknown'{s}'(v1, v3));",
+                t = fun_ty_boogie_name,
+                s = suffix,
+            );
+            emitln!(self.writer, "{}", symmetry);
+            emitln!(self.writer, "{}", transitivity);
+            let is_unknown = |v: &str| {
+                unknown_variants
+                    .iter()
+                    .map(|name| format!("{} is {}", v, name))
+                    .join(" || ")
+            };
+            format!(
+                "(({}) || ({})) && $IsEqualUnknown'{}'(v1, v2)",
+                is_unknown("v1"),
+                is_unknown("v2"),
+                suffix
+            )
+        };
+        if !any_ghost_capture {
+            let body = if may_be_equal.is_empty() {
+                "v1 == v2".to_string()
+            } else {
+                format!("v1 == v2 || ({})", may_be_equal)
+            };
+            emitln!(
+                self.writer,
+                "function {{:inline}} $IsEqual'{}'(v1: {}, v2: {}): bool {{ {} }}",
+                suffix,
+                fun_ty_boogie_name,
+                fun_ty_boogie_name,
+                body,
+            );
+        } else {
+            // Captures compare through `$IsEqual`, which may recurse into this very type; an
+            // inlined function cannot, so equality is defined by an axiom.
+            let mut clauses = vec![];
             for (idx, info) in closure_infos.iter().enumerate() {
                 let pack_name = boogie_closure_pack_name(self.env, &info.fun, info.mask);
                 let mut clause = format!("(v1 is {} && v2 is {}", pack_name, pack_name);
@@ -1013,27 +1064,38 @@ impl<'env> BoogieTranslator<'env> {
                     );
                 }
                 clause += ")";
-                emitln!(self.writer, "{}{}", sep, clause);
-                sep = "|| ";
+                clauses.push(clause);
             }
             for info in fun_param_infos.iter() {
                 let name = boogie_fun_param_name(self.env, &info.fun, info.param_sym);
-                emitln!(self.writer, "{}(v1 is {} && v2 is {})", sep, name, name);
-                sep = "|| ";
+                clauses.push(format!("(v1 is {} && v2 is {})", name, name));
             }
             for info in struct_field_infos.iter() {
                 let name = boogie_struct_field_name(self.env, &info.struct_id, info.field_sym);
-                emitln!(
-                    self.writer,
-                    "{}(v1 is {} && v2 is {} && v1->n == v2->n)",
-                    sep,
-                    name,
-                    name
-                );
-                sep = "|| ";
+                clauses.push(format!(
+                    "(v1 is {} && v2 is {} && v1->n == v2->n)",
+                    name, name
+                ));
             }
-            self.writer.unindent();
-            emitln!(self.writer, "}");
+            if !may_be_equal.is_empty() {
+                clauses.push(format!("({})", may_be_equal));
+            }
+            emitln!(
+                self.writer,
+                "function $IsEqual'{}'(v1: {}, v2: {}): bool;",
+                suffix,
+                fun_ty_boogie_name,
+                fun_ty_boogie_name,
+            );
+            emitln!(
+                self.writer,
+                "axiom (forall v1: {}, v2: {} :: {{$IsEqual'{}'(v1, v2)}} $IsEqual'{}'(v1, v2) <==> ({}));",
+                fun_ty_boogie_name,
+                fun_ty_boogie_name,
+                suffix,
+                suffix,
+                clauses.join(" || ")
+            );
         }
 
         let has_opaque_variant = closure_infos.iter().any(|info| {
@@ -1569,6 +1631,16 @@ impl<'env> BoogieTranslator<'env> {
         let frame_access_raw = derive_closure_frame_access(fun_env, &info.fun.inst);
         let frame_access = self.closure_frame_to_apply_frame(&frame_access_raw, &bp_arg_list);
 
+        // The target's abort condition, frame and ensures hold only under its `requires`.
+        // When it fails, abort and memory are unknown; results stay the result function of
+        // the pre-state, where its axiom finds `requires_of` false and adds nothing.
+        let guarded = fun_env.get_spec().any_kind(ConditionKind::Requires);
+        if guarded {
+            let requires_name =
+                boogie_behavioral_fun_spec_name(self.env, &info.fun, BehaviorKind::RequiresOf);
+            emitln!(self.writer, "if ({}({})) {{", requires_name, bp_args);
+            self.writer.indent();
+        }
         // Get spec memory for building post-state args
         self.emit_behavioral_predicate_body(
             &aborts_name,
@@ -1585,6 +1657,31 @@ impl<'env> BoogieTranslator<'env> {
             memory,
             &frame_access,
         );
+        if guarded {
+            self.writer.unindent();
+            emitln!(self.writer, "} else {");
+            self.writer.indent();
+            emitln!(self.writer, "havoc $abort_flag, $abort_code;");
+            let mut_ref_param_indices: Vec<usize> = params
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.is_mutable_reference())
+                .map(|(idx, _)| idx)
+                .collect();
+            self.emit_result_assignments(
+                result_locals,
+                &explicit_results,
+                &mut_ref_param_indices,
+                &result_fun_name,
+                &multi_result_fun_name,
+                &bp_args,
+            );
+            for (_, mem_name) in memory {
+                emitln!(self.writer, "havoc {};", mem_name);
+            }
+            self.writer.unindent();
+            emitln!(self.writer, "}");
+        }
     }
 
     /// Convert `FrameAccessKind` (with Exp-level addresses) to `ApplyFrameAccess`
@@ -1700,7 +1797,6 @@ impl<'env> BoogieTranslator<'env> {
             .filter(|(_, p)| p.is_mutable_reference())
             .map(|(idx, _)| idx)
             .collect();
-        let first_mut_ref_param = mut_ref_param_indices.first().copied();
 
         // Compute which memory names are covered by frame_access
         let covered_by_frame: BTreeSet<String> = frame_access
@@ -1824,82 +1920,14 @@ impl<'env> BoogieTranslator<'env> {
         let result_bp_args = post_mem_args.iter().chain(data_args.iter()).join(", ");
 
         // Assign results using result_of function (now using post-state args)
-        if !result_locals.is_empty() {
-            if result_locals.len() == 1 {
-                let result_local = &result_locals[0];
-                if explicit_result_count == 1 {
-                    if explicit_results[0].is_mutable_reference() {
-                        let base_param = first_mut_ref_param.unwrap_or(0);
-                        emitln!(
-                            self.writer,
-                            "{} := $ChildMutation(p{}, -1, {}({}));",
-                            result_local,
-                            base_param,
-                            result_fun_name,
-                            result_bp_args
-                        );
-                    } else {
-                        emitln!(
-                            self.writer,
-                            "{} := {}({});",
-                            result_local,
-                            result_fun_name,
-                            result_bp_args
-                        );
-                    }
-                } else {
-                    // Mutable reference param output: wrap in $UpdateMutation
-                    let param_idx = mut_ref_param_indices[0];
-                    emitln!(
-                        self.writer,
-                        "{} := $UpdateMutation(p{}, {}({}));",
-                        result_local,
-                        param_idx,
-                        result_fun_name,
-                        result_bp_args
-                    );
-                }
-            } else {
-                // Multiple results: use tuple projection
-                for (i, result_local) in result_locals.iter().enumerate() {
-                    if i < explicit_result_count {
-                        if explicit_results[i].is_mutable_reference() {
-                            let base_param = first_mut_ref_param.unwrap_or(0);
-                            emitln!(
-                                self.writer,
-                                "{} := $ChildMutation(p{}, -1, {}({})->${});",
-                                result_local,
-                                base_param,
-                                multi_result_fun_name,
-                                result_bp_args,
-                                i
-                            );
-                        } else {
-                            emitln!(
-                                self.writer,
-                                "{} := {}({})->${};",
-                                result_local,
-                                multi_result_fun_name,
-                                result_bp_args,
-                                i
-                            );
-                        }
-                    } else {
-                        let mut_ref_idx = i - explicit_result_count;
-                        let param_idx = mut_ref_param_indices[mut_ref_idx];
-                        emitln!(
-                            self.writer,
-                            "{} := $UpdateMutation(p{}, {}({})->${});",
-                            result_local,
-                            param_idx,
-                            multi_result_fun_name,
-                            result_bp_args,
-                            i
-                        );
-                    }
-                }
-            }
-        }
+        self.emit_result_assignments(
+            result_locals,
+            explicit_results,
+            &mut_ref_param_indices,
+            result_fun_name,
+            multi_result_fun_name,
+            &result_bp_args,
+        );
 
         // Build result args for ensures_of, dereferencing mutable reference results.
         // Behavioral predicates reason over plain values, not mutation types.
@@ -1927,6 +1955,96 @@ impl<'env> BoogieTranslator<'env> {
 
         self.writer.unindent();
         emitln!(self.writer, "}");
+    }
+
+    /// Assigns an `$apply` variant's result locals from the target's result function applied
+    /// to `result_args`: explicit results first, then the `&mut` parameter outputs.
+    fn emit_result_assignments(
+        &self,
+        result_locals: &[String],
+        explicit_results: &[Type],
+        mut_ref_param_indices: &[usize],
+        result_fun_name: &str,
+        multi_result_fun_name: &str,
+        result_args: &str,
+    ) {
+        let first_mut_ref_param = mut_ref_param_indices.first().copied();
+        if !result_locals.is_empty() {
+            if result_locals.len() == 1 {
+                let result_local = &result_locals[0];
+                if explicit_results.len() == 1 {
+                    if explicit_results[0].is_mutable_reference() {
+                        let base_param = first_mut_ref_param.unwrap_or(0);
+                        emitln!(
+                            self.writer,
+                            "{} := $ChildMutation(p{}, -1, {}({}));",
+                            result_local,
+                            base_param,
+                            result_fun_name,
+                            result_args
+                        );
+                    } else {
+                        emitln!(
+                            self.writer,
+                            "{} := {}({});",
+                            result_local,
+                            result_fun_name,
+                            result_args
+                        );
+                    }
+                } else {
+                    // Mutable reference param output: wrap in $UpdateMutation
+                    let param_idx = mut_ref_param_indices[0];
+                    emitln!(
+                        self.writer,
+                        "{} := $UpdateMutation(p{}, {}({}));",
+                        result_local,
+                        param_idx,
+                        result_fun_name,
+                        result_args
+                    );
+                }
+            } else {
+                // Multiple results: use tuple projection
+                for (i, result_local) in result_locals.iter().enumerate() {
+                    if i < explicit_results.len() {
+                        if explicit_results[i].is_mutable_reference() {
+                            let base_param = first_mut_ref_param.unwrap_or(0);
+                            emitln!(
+                                self.writer,
+                                "{} := $ChildMutation(p{}, -1, {}({})->${});",
+                                result_local,
+                                base_param,
+                                multi_result_fun_name,
+                                result_args,
+                                i
+                            );
+                        } else {
+                            emitln!(
+                                self.writer,
+                                "{} := {}({})->${};",
+                                result_local,
+                                multi_result_fun_name,
+                                result_args,
+                                i
+                            );
+                        }
+                    } else {
+                        let mut_ref_idx = i - explicit_results.len();
+                        let param_idx = mut_ref_param_indices[mut_ref_idx];
+                        emitln!(
+                            self.writer,
+                            "{} := $UpdateMutation(p{}, {}({})->${});",
+                            result_local,
+                            param_idx,
+                            multi_result_fun_name,
+                            result_args,
+                            i
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Generate a behavioral predicate evaluator for a function type.
@@ -9475,10 +9593,6 @@ fn struct_has_native_equality(
     ) {
         return false;
     }
-    if options.native_equality {
-        // Everything else has native equality
-        return true;
-    }
     if struct_env.has_variants() {
         for variant in struct_env.get_variants() {
             for field in struct_env.get_fields_of_variant(variant) {
@@ -9519,10 +9633,9 @@ pub fn has_native_equality(env: &GlobalEnv, options: &BoogieOptions, ty: &Type) 
             struct_has_native_equality(&env.get_struct_qid(mid.qualified(*sid)), sinst, options)
         },
         Type::Tuple(elems) => elems.iter().all(|e| has_native_equality(env, options, e)),
-        // Function values compare through their closure captures: ghost-
-        // bearing captures disqualify raw equality like any other ghost
-        // (their `$IsEqual` is the per-variant fieldwise form).
-        Type::Fun(..) => !type_has_ghost_transitively(env, ty),
+        // Function values of unknown identity (parameters, struct fields) may be equal
+        // although their constructors differ, so function equality is always `$IsEqual`.
+        Type::Fun(..) => false,
         // Type parameters only reach this predicate in open (uninterpreted
         // sort) contexts, where raw equality is the model of Move equality.
         Type::Primitive(_)
